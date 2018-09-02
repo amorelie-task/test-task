@@ -1,0 +1,567 @@
+---
+title: "Amorelie Data Science Task"
+author: "Stanislav Chekmenev"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    df_print: paged
+    fig_height: 5
+    fig_width: 11
+    toc: yes
+    toc_depth: 4
+    toc_float: no
+  html_document:
+    df_print: paged
+    toc: yes
+    toc_depth: '4'
+---
+
+```{r setup, include=FALSE}
+setwd(getwd())
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(tidyverse)
+library(data.table)
+library(zoo)
+library(lubridate)
+library(forecast)
+library(dtw)
+library(plotly)
+```
+
+
+### Data exploration
+
+##### Initial look at the data
+
+Let's load the datasets and apply some simple functions for initial analysis.
+
+```{r}
+dt_prods <- fread("data/products.csv", stringsAsFactors = T)
+dt_sales <- fread("data/sales.csv", stringsAsFactors = T)
+
+head(dt_prods)
+summary(dt_prods)
+
+head(dt_sales)
+summary(dt_sales)
+```
+
+There are 417 NA's in the selling price column, which only makes sense to me if a product was given for free because of some action or so. 417 out of 38559 rows is 1%, which I will simply delete and forget about NA's.
+
+```{r}
+dt_sales <- dt_sales[!(is.na(selling_price))]
+```
+
+Let me see if unique product id's in dt_prods and in dt_sales correspond to each other without exceptions.
+
+```{r}
+all.equal(
+  dt_prods %>% select(product_id) %>% as.character,
+  dt_sales %>% select(product_id) %>% unique %>% as.character
+)
+```
+
+I will merge the data tables on "product_id"
+
+```{r}
+dt_main <- dt_prods %>% 
+  merge(dt_sales, by = "product_id") %>% 
+  arrange(product_id, date) %>% 
+  data.table
+head(dt_main)
+```
+
+
+I will convert all the dates to Date format.
+
+```{r}
+dt_main$date <- as.Date(dt_main$date)
+```
+
+
+#### Further exploration and transformation of the data
+
+Firstly, let's get rid of the rows with 0 price that I found out in the dataset. Here they are:
+
+```{r}
+head(dt_main[selling_price == 0],10)
+```
+
+What is weird, that there are 0 units sold for those rows. Let's see if there were at least some rows with units sold for 0 Euro.
+
+```{r}
+paste0("Number of units sold for 0 Euro is ", nrow(dt_main[selling_price == 0 & units_sold > 0]))
+```
+
+Only one. Well, seems still weird to me, so I'll simply delete all rows with 0 price.
+
+```{r}
+dt_main <- dt_main[selling_price > 0,]
+```
+
+Are selling prices constant?
+
+```{r}
+dt_main %>%
+  ggplot(aes(x = selling_price, fill = factor(product_id))) +
+    geom_histogram(binwidth = 1) +
+    xlab("Selling price") +
+    labs(fill = "Products ID's")
+```
+
+They are not, some have higher variance, some lower though. They might vary because of promotion events. Let's see if that's the case.
+
+```{r}
+dt_main %>%
+  ggplot(aes(x = interaction(promotion_dummy_1, promotion_dummy_2), y = selling_price, fill = factor(product_id))) +
+    geom_boxplot() +
+    facet_wrap(~product_id, scales = "free_y") +
+    xlab("Promotion dummies (1,2)") +
+    ylab("Selling Price") +
+    labs(fill = "Product_ID's") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Sure, this plot is not 100% accurate, since a promotion event can occur, let's say, in a year, when the prices are already significantly different from the ones a year ago, but as a first approximation it should work well. The plots show that there is basically no impact of promotion dummies, almost all medians are the same except for 2 product ID's, but I'll consider them the same, too. I could also fit a linear model for each product and see the impacts of the dummies, but in this simple case such a plot is enough. So, the price is changing with time and doesn't depend on the promotion.
+
+Does the price depend on a website?
+
+```{r}
+dt_main %>%
+  ggplot(aes(x = factor(website), y = selling_price, fill = factor(product_id))) +
+    geom_boxplot() +
+    facet_wrap(~product_id, scales = "free_y") +
+    xlab("Website") +
+    ylab("Selling Price") +
+    labs(fill = "Product_ID's") +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Look's like on the 2nd website the prices are higher in most of the cases and the prices are similar on the 1st and the 3rd websites. I'll average out the price between all three sites, add a column with the proportion of units sold per day on each of the websites and remove the website column.
+
+```{r}
+# Cast units sold between the websites
+dt_main <- dt_main %>% 
+  group_by(product_id, date) %>%
+  mutate(average_price = mean(selling_price)) %>% 
+  data.table %>% 
+  dcast(product_id + 
+          average_price + 
+          brand + 
+          main_category_id + 
+          parent_category_id + 
+          promotion_dummy_1 + 
+          promotion_dummy_2 + 
+          date ~ website, 
+        fun = sum,value.var = "units_sold") %>% 
+  setkey(product_id,date)
+colnames(dt_main)[c(9,10,11)] <- c("units_sold_web_1","units_sold_web_2","units_sold_web_3")
+
+# Return the total units sold column adn add 3 ones with the proportions of sold units between the websites.
+dt_main <- dt_main %>% 
+  group_by(product_id, date) %>% 
+  mutate(units_sold = sum(units_sold_web_1,units_sold_web_2,units_sold_web_3),
+         web1_prop = units_sold_web_1/units_sold,
+         web2_prop = units_sold_web_2/units_sold,
+         web3_prop = units_sold_web_3/units_sold,
+         promotion_dummy_1 =as.numeric(ifelse(promotion_dummy_1 == "Yes",1,0)),
+         promotion_dummy_2 =as.numeric(ifelse(promotion_dummy_2 == "Yes",1,0))) %>% 
+  select(-c(units_sold_web_1, units_sold_web_2, units_sold_web_3)) %>% 
+  replace_na(list(web1_prop = 0, web2_prop = 0, web3_prop= 0)) %>% 
+  data.table 
+
+# Let's add a column with the price range to have one more criterion of categorization of products
+# A range is arbitrary and can be varied according to a user's wish.
+price_range <- 25
+dt_main[,price_range := dt_main$average_price %>% 
+          cut(breaks = seq(floor(min(dt_main$average_price)/price_range)*price_range,
+                           ceiling(max(dt_main$average_price)/price_range)*price_range,by=price_range), right = TRUE)]
+```
+
+
+### Modelling
+
+Since the task would be to predict thousands of SKU's I want to make the solution scalable. 
+
+* One approach would be to use a DWT-clustering algorithm to cluster similar time-series, then combine them and predict for each cluster. This approach is good and recommended  [here](https://ac.els-cdn.com/S2405896315005923/1-s2.0-S2405896315005923-main.pdf?_tid=f061262b-3bea-448a-a545-b0f71c205127&acdnat=1535635912_0f7102cb0c4afee32732d70cfeba6d60), for example, though I'm not sure how to incorporate additional predictors there. It can very well be that two similar time-series would have completely different selling prices, which is a valuable predictor. 
+
+* Another clustering method would be to simply cluster the time-series by a category, price range or anything they have in common. It might be tempting to do so, but I can easily imagine a situation when there are 2 products sharing the same attribute but they are just different in everything else. **However, this method is inevitable if there is a new product without any data, so we just need to look for a similar product and forecast using the data from that similar product.** 
+
+* I will write a function that would forecast for each SKU, "forecast_SKU". 
+    * The function would take as its arguments a preprocessed data table as dt_main, a product_id, a number of days to forecast ahead, and 2 promotion dummies, either 0 or 1 for each of them.
+    
+* If one wants to forecast for a SKU with a small number of data points, then one needs to choose a filter (price range, brand, main category, parent category), all products satisfying the filter condition are shown and then the dynamic time warping algorithm is used to find the most similar time series in the set. One can use that time series for forecasting. So I'll write a helper function that one would use together with "forecast_SKU".
+    
+* If it's a new SKU a forecast should be based on similar existing SKU's. It depends on the user, but some metrics should be considered: price, brand, main category and parent category. So one would need to pick by hand a similar SKU and simply run a forecast with the "forecast_SKU" function.
+    
+
+Here are all the functions:
+```{r}
+# A helper function to filter the products
+get_filtered_dt <- function(dt,  filter_conditions) {
+  
+  # dt -- a data table to filter
+  # filter_conditions -- a named list of filter conditions in the form of a list(column name = value),
+  # where the column name is a name of the column to use in the filter and the value is the filter value
+  
+  # Extract column to filter and convert them into symbols
+  filter_cols <- lapply(1:length(filter_conditions), function(i) names(filter_conditions[i]) %>% sym)
+  # Extract values
+  values <-  values <- filter_conditions %>% unlist %>% unname
+  # Create quosures
+  filter_cols_quo <- lapply(1:length(filter_cols), function(i) quo((!! filter_cols[[i]]) == !! values[i]))
+  
+  # Apply all filter conditions
+  dt <- dt %>% filter(!!! filter_cols_quo) %>% data.table
+  
+  return(dt)
+}
+```
+
+
+```{r}
+# A function to find a similar product
+find_similar_SKU <- function(dt, prod_id) {
+  
+  # dt -- a data table to search in
+  # prod_id -- a product_id of a product of interest for which one wants to find a product with a similar 
+  # pattern of units sold per day
+  
+  # The code is taken from here:
+  # https://stackoverflow.com/questions/45945769/how-to-apply-dtw-algorithm-on-multiple-time-series-in-r
+  # and slightly changed
+  
+  # Units sold of prod_id product
+  units_sold_prod_id <- split(dt[product_id == prod_id]$units_sold, dt[product_id == prod_id]$product_id)
+  # Get the units sold by all products, except for the chosen one
+  units_sold_all_but_one <- split(dt[product_id != prod_id]$units_sold, dt[product_id != prod_id]$product_id)
+  # ID's of products
+  ids <- names(units_sold_all_but_one) %>% as.numeric
+  # Create a data table with the combinations of product names and prod_id
+  dt_ids <- expand.grid(ids, prod_id) %>% data.table
+  # Create a data table with the values of units sold by of all products VS 
+  dt_values <- expand.grid(units_sold_all_but_one, units_sold_prod_id) %>% data.table
+    
+  # Calculate Euclidean distances 
+  distance <- purrr::map_dbl(1:nrow(dt_values), ~dtw(x = dt_values[.x,Var1][[1]], y = dt_values[.x,Var2][[1]])$distance)
+  
+  # Resulted data table 
+  dt_res <- dt_ids %>% mutate(distance = distance) %>% data.table
+  
+  # Choose the product_id with the minimum distance
+  similar_product <- dt_res[distance == min(distance), Var1]
+  
+  return(list(similar_product = similar_product, results = dt_res))
+}
+```
+
+
+```{r}
+# A function to forecast
+forecast_SKU <- function(dt, prod_id, h_fcast, promotion_1 = 0, promotion_2 = 0) {
+  
+  # dt -- a data table with the products
+  # prod_id -- a SKU to forecast for
+  # h_fcast -- number of days for forecast
+  # promotion_1 = {0,1} -- if promotion of type 1 will be used in the next h_fcast days (default: 0)
+  # promotion_2 = {0,1} -- if promotion of type 2 will be used in the next h_fcast days (default: 0)
+  
+  # Pick an SKU of interest
+  dt_train <- dt[product_id == prod_id,] %>% 
+    arrange(date) %>% 
+    data.table
+  
+  # Check if we have more than a year of data and if yes, account for yearly seasonality
+  if (nrow(dt_train) >= 365) {
+    
+      # Convert sold units to a time-series format and calculate first 5 coefficients of a Fourier series
+      units_sold <- dt_train$units_sold
+      units_sold_ts_train <- ts(units_sold, frequency = 7)
+      # A matrix of fourier components to use as regressors (one could tune K, too) to account for seasonality
+      fourier_components_train <- fourier(ts(units_sold, frequency = 365.25), K=5)
+      fourier_components_fcast <-  fourier(ts(units_sold, frequency = 365.25), K=5, h = h_fcast)
+      
+      # Define regressors but avoid promotion_dummes with all zeros or ones
+      if (length(dt_train[,promotion_dummy_1] %>% unique) == 1 & length(dt_train[,promotion_dummy_2] %>% unique) != 1) {
+        
+        regressors_train <- cbind(average_price = dt_train[, average_price],
+                                  promotion_dummy_2 = dt_train[, promotion_dummy_2],
+                                  web1_prop = dt_train[,web1_prop],
+                                  web2_prop = dt_train[,web2_prop],
+                                  web3_prop = dt_train[,web3_prop])
+      
+        regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                  promotion_dummy_2 = promotion_2,
+                                  web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                  web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                  web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+      
+      } else if (length(dt_train[,promotion_dummy_1] %>% unique) != 1 & length(dt_train[,promotion_dummy_2] %>% unique) == 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                  promotion_dummy_1 = dt_train[, promotion_dummy_1],
+                                  web1_prop = dt_train[,web1_prop],
+                                  web2_prop = dt_train[,web2_prop],
+                                  web3_prop = dt_train[,web3_prop])
+      
+          regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    promotion_dummy_1 = promotion_1,
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+        
+      }  else if (length(dt_train[,promotion_dummy_1] %>% unique) == 1 & length(dt_train[,promotion_dummy_2] %>% unique) == 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                    web1_prop = dt_train[,web1_prop],
+                                    web2_prop = dt_train[,web2_prop],
+                                    web3_prop = dt_train[,web3_prop])
+      
+          regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+        
+      } else if (length(dt_train[,promotion_dummy_1] %>% unique) != 1 & length(dt_train[,promotion_dummy_2] %>% unique) != 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                    promotion_dummy_1 = dt_train[, promotion_dummy_1],
+                                    promotion_dummy_2 =dt_train[, promotion_dummy_2],
+                                    web1_prop = dt_train[,web1_prop],
+                                    web2_prop = dt_train[,web2_prop],
+                                    web3_prop = dt_train[,web3_prop])
+      
+         regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    promotion_dummy_1 = promotion_1,
+                                    promotion_dummy_2 = promotion_2,
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+      }
+      
+    
+      # Fit an auto.arima model
+      model <- auto.arima(units_sold_ts_train, 
+                          xreg=cbind(fourier_components_train,regressors_train), 
+                          stationary = F, 
+                          seasonal = F, 
+                          stepwise = F,
+                          approximation = T,
+                          allowmean = T,
+                          allowdrift = T,
+                          lambda = "auto",
+                          parallel = T,
+                          num.cores = 6)
+
+      # Forecast on a train set and check the accuracy
+      acc_dt <- accuracy(model)
+      
+      # Forecast
+      fcast <- forecast(model, xreg = cbind(fourier_components_fcast,regressors_fcast), h = h_fcast)
+      
+      return(list(model = model, train_accuracy = acc_dt, forecast = fcast))
+      
+  } else {
+    
+      # Convert sold units to a time-series format and calculate first 5 coefficients of a Fourier series
+      units_sold <- dt$units_sold
+      units_sold_ts_train <- ts(units_sold, frequency = 7)
+      
+      # Define regressors but avoid promotion_dummes with all zeros or ones
+      if (length(dt_train[,promotion_dummy_1] %>% unique) == 1 & length(dt_train[,promotion_dummy_2] %>% unique) != 1) {
+        
+        regressors_train <- cbind(average_price = dt_train[, average_price],
+                                  promotion_dummy_2 = dt_train[, promotion_dummy_2],
+                                  web1_prop = dt_train[,web1_prop],
+                                  web2_prop = dt_train[,web2_prop],
+                                  web3_prop = dt_train[,web3_prop])
+      
+        regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                  promotion_dummy_2 = promotion_2,
+                                  web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                  web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                  web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+      
+      } else if (length(dt_train[,promotion_dummy_1] %>% unique) != 1 & length(dt_train[,promotion_dummy_2] %>% unique) == 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                  promotion_dummy_1 = dt_train[, promotion_dummy_1],
+                                  web1_prop = dt_train[,web1_prop],
+                                  web2_prop = dt_train[,web2_prop],
+                                  web3_prop = dt_train[,web3_prop])
+      
+          regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    promotion_dummy_1 = promotion_1,
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+        
+      }  else if (length(dt_train[,promotion_dummy_1] %>% unique) == 1 & length(dt_train[,promotion_dummy_2] %>% unique) == 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                    web1_prop = dt_train[,web1_prop],
+                                    web2_prop = dt_train[,web2_prop],
+                                    web3_prop = dt_train[,web3_prop])
+      
+          regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+          
+      } else if (length(dt_train[,promotion_dummy_1] %>% unique) != 1 & length(dt_train[,promotion_dummy_2] %>% unique) != 1) {
+        
+          regressors_train <- cbind(average_price = dt_train[, average_price],
+                                    promotion_dummy_1 = dt_train[, promotion_dummy_1],
+                                    promotion_dummy_2 = dt_train[, promotion_dummy_2],
+                                    web1_prop = dt_train[,web1_prop],
+                                    web2_prop = dt_train[,web2_prop],
+                                    web3_prop = dt_train[,web3_prop])
+      
+          regressors_fcast <- cbind(average_price = rep(mean(dt_train[-(1:(nrow(dt_train)-h_fcast)),average_price]), h_fcast),
+                                    promotion_dummy_1 = promotion_1,
+                                    promotion_dummy_2 = promotion_2,
+                                    web1_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web1_prop],1),
+                                    web2_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web2_prop],1),
+                                    web3_prop = rep(dt_train[-(1:(nrow(dt_train)-h_fcast)),web3_prop],1))
+      }
+      
+    
+      # Fit an auto.arima model
+      model <- auto.arima(units_sold_ts_train, 
+                          xreg=regressors_train, 
+                          stationary = F, 
+                          seasonal = T, 
+                          stepwise = F,
+                          approximation = F,
+                          allowmean = T,
+                          allowdrift = T,
+                          lambda = "auto",
+                          parallel = T,
+                          num.cores = 6)
+
+      # Forecast on a train set and check the accuracy
+      acc_dt <- accuracy(model)
+      
+      # Forecast
+      fcast <- forecast(model, xreg = regressors_fcast, h = h_fcast)
+      
+      return(list(model = model, train_accuracy = acc_dt, forecast = fcast))
+    
+  } 
+}
+```
+   
+**Using 3 functions written above one can either forcast for a product of interest or to search for a similar product and then forecast.**
+
+### Examples of forecasting with forecast_SKU function
+
+Let's consider 3 examples how one can use "forecast_SKU" function.
+
+#### Forecast for a SKU of choice from dt_main.
+
+Here's the list of all SKU's with the number of sale days they have data for.
+
+```{r, rows.print = 17}
+dt_main %>% count(product_id)
+```
+
+Let's just take one SKU with the medium amount of data, say 38078, and apply the function to forecast for 35 days ahead.
+
+```{r}
+forecast_38078 <- forecast_SKU(dt = dt_main, prod_id = 38078, h_fcast = 35, promotion_1 = 0, promotion_2 = 0)
+
+print("Model:")
+forecast_38078$model
+
+print("Train accuracy:")
+forecast_38078$train_accuracy
+
+print("Plot the forecast with plotly library to be able to zoom-in")
+ggplotly(autoplot(forecast_38078$forecast))
+```
+
+
+#### Forecast for a SKU with not enough data using DTW-algorithm.
+
+Let's pick an SKU with the least available amount of data and choose a similar SKU, based on the Euclidean distance between 2 time-series, to forecast.
+
+The SKU with the least amount of data points is 54417.
+
+```{r}
+similar_SKU <- find_similar_SKU(dt = dt_main, prod_id = 54417)
+
+paste0("A product_id of a similar SKU is ", similar_SKU$similar_product)
+
+print("The data table with the Euclidean distances is:")
+similar_SKU$results
+```
+We found a similar SKU, so we can forecast using it.
+
+```{r}
+forecast_similar_SKU <- forecast_SKU(dt = dt_main, prod_id = similar_SKU$similar_product, h_fcast = 35, promotion_1 = 0, promotion_2 = 0)
+
+print("Model:")
+forecast_similar_SKU$model
+
+print("Train accuracy:")
+forecast_similar_SKU$train_accuracy
+
+print("Plot the forecast:")
+ggplotly(autoplot(forecast_similar_SKU$forecast))
+```
+
+
+####  Forecast for a SKU using a filter and DTW-algorithm
+
+Let's apply a filter before calling "find_similar_SKU" function and let's use a different SKU this time, since 54417 is quite unique regarding its price range and main category. I'll take 46853.
+
+The first filter will be the price range and the second will be main category.
+
+The price range of 46853 SKU is:
+
+```{r}
+dt_main[product_id == 46853,] %>% 
+  select(price_range) %>% 
+  droplevels %>% 
+  sapply(levels)
+```
+
+Well, since the price was changing and it covers two price ranges, I'll simply pick the one in the middle, 125.
+
+```{r}
+filtered_dt <- get_filtered_dt(dt = dt_main, filter_conditions = list(price_range = "(100,125]"))
+filtered_SKUs <- filtered_dt$product_id %>% unique
+
+print("The SKU's in the similar price range:")
+filtered_SKUs
+```
+
+Let's use them to find a similar SKU for the SKU 46853
+
+```{r}
+similar_SKU_1 <- find_similar_SKU(dt = dt_main[product_id %in% filtered_SKUs,], prod_id = 46853)
+
+paste0("A product_id of a similar SKU is ", similar_SKU_1$similar_product)
+
+print("The data table with the Euclidean distances is:")
+similar_SKU_1$results
+```
+
+And now we can forecast:
+
+```{r}
+forecast_similar_SKU_1 <- forecast_SKU(dt = dt_main, prod_id = similar_SKU_1$similar_product, h_fcast = 35, promotion_1 = 0, promotion_2 = 0)
+
+print("Model:")
+forecast_similar_SKU_1$model
+
+print("Train accuracy:")
+forecast_similar_SKU_1$train_accuracy
+
+print("Plot the forecast:")
+ggplotly(autoplot(forecast_similar_SKU_1$forecast))
+```
+
+### Conclusion
+
+**This technique is far from perfect but it's very agile and can be easily improved.**
